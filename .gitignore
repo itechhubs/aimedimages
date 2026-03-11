@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.env/
+.venv/
+venv/
+
+# IDE
+.vscode/
+
+# Data files (too large for git)
+data/
+images/
+
+# Training outputs (too large for repo)
+outputs/
+
+# OS
+Thumbs.db
+.DS_Store
