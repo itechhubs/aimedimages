@@ -42,7 +42,7 @@ class Config:
     # ── Model ───────────────────────────────────────────────────────────
     backbone: str = "convnext_base.fb_in22k_ft_in1k_384"
     backbone_features: int = 1024          # last-stage channel dim
-    image_size: int = 512
+    image_size: int = 1024
     num_classes: int = 14
     metadata_dim: int = 5                  # age, gender, followup, view_pos, has_followups
     meta_hidden: int = 128
@@ -51,8 +51,8 @@ class Config:
 
     # ── Training ────────────────────────────────────────────────────────
     epochs: int = 50
-    batch_size: int = 16
-    grad_accum_steps: int = 2              # effective batch = 32
+    batch_size: int = 4
+    grad_accum_steps: int = 8              # effective batch = 32
     learning_rate: float = 3e-5            # backbone LR (low to preserve pretrained features)
     head_lr_multiplier: float = 10.0       # head gets 3e-4
     weight_decay: float = 2e-4

@@ -197,7 +197,9 @@ def compute_auc(
     disease_classes: list,
 ) -> dict:
     """Per-class and mean AUC-ROC.  Returns dict with per-class & mean AUC."""
-    probs = 1.0 / (1.0 + np.exp(-all_logits))   # sigmoid
+    # Clip logits to avoid overflow in exp() for large negative values
+    clipped = np.clip(all_logits, -500, 500)
+    probs = 1.0 / (1.0 + np.exp(-clipped))   # sigmoid
     aucs = {}
     valid_aucs = []
     for i, name in enumerate(disease_classes):
