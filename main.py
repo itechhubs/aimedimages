@@ -24,6 +24,7 @@ import torch
 from src.config import Config
 from src.dataset import (
     build_loaders,
+    compute_class_alpha,
     compute_class_weights,
     compute_follow_up_stats,
     load_and_prepare_data,
@@ -113,6 +114,7 @@ def main() -> None:
     train_df, val_df = split_by_patient(df, cfg)
 
     class_weights = compute_class_weights(train_df, cfg)
+    class_alpha = compute_class_alpha(train_df, cfg)
     train_loader, val_loader = build_loaders(train_df, val_df, bbox_dict, cfg)
 
     logger.info("Train batches: %d  |  Val batches: %d",
@@ -137,6 +139,7 @@ def main() -> None:
         val_loader=val_loader,
         cfg=cfg,
         pos_weight=class_weights,
+        class_alpha=class_alpha,
     )
 
     # ── Train ───────────────────────────────────────────────────────────

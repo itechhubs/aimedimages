@@ -57,7 +57,8 @@ class Config:
     head_lr_multiplier: float = 10.0       # head gets 3e-4
     weight_decay: float = 2e-4
     freeze_backbone_epochs: int = 3        # Phase 1: train heads only
-    warmup_epochs: int = 2                 # linear warmup after backbone unfreeze
+    warmup_epochs: int = 2                 # linear warmup after each phase transition
+    partial_unfreeze_epochs: int = 5       # Phase 2: last backbone stage(s) unfrozen
     min_lr: float = 1e-7
 
     # ── LR scheduler (ReduceLROnPlateau) ────────────────────────────────
@@ -67,6 +68,10 @@ class Config:
     # ── EMA (Exponential Moving Average) ────────────────────────────────
     use_ema: bool = True
     ema_decay: float = 0.999
+
+    # ── Test Time Augmentation (TTA) ───────────────────────────────────
+    use_tta: bool = True
+    tta_augmentations: int = 5             # number of TTA views (incl. original)
 
     # ── Hardware (HP Z840 + RTX 3090) ───────────────────────────────────
     num_workers: int = 8

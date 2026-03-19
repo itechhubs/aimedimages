@@ -8,6 +8,7 @@ import time
 
 import numpy as np
 import torch
+import torchvision.transforms.functional as TF
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -18,10 +19,11 @@ logger = logging.getLogger(__name__)
 
 
 class Trainer:
-    """Handles the full training/validation lifecycle with phased training.
+    """Handles the full training/validation lifecycle with 3-phase progressive fine-tuning.
 
-    Phase 1 – backbone frozen, train classification/detection heads only.
-    Phase 2 – backbone unfrozen with low LR + linear warmup, heads at higher LR.
+    Phase 1 -- backbone frozen, train classification/detection heads only.
+    Phase 2 -- last backbone stage unfrozen (high-level feature adaptation).
+    Phase 3 -- full backbone unfrozen with low LR (preserve pretrained knowledge).
     """
 
     def __init__(
@@ -31,21 +33,33 @@ class Trainer:
         val_loader,
         cfg: Config,
         pos_weight: torch.Tensor | None = None,
+        class_alpha: torch.Tensor | None = None,
     ) -> None:
         self.cfg = cfg
         self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
 
-        # ── Loss ────────────────────────────────────────────────────────
+        # ── Loss (with per-class alpha for class imbalance) ─────────────
         pw = pos_weight.to(self.device) if pos_weight is not None else None
-        self.criterion = CombinedLoss(cfg, pos_weight=pw).to(self.device)
+        ca = class_alpha.to(self.device) if class_alpha is not None else None
+        self.criterion = CombinedLoss(cfg, pos_weight=pw, class_alpha=ca).to(self.device)
 
-        # ── Phase management ────────────────────────────────────────────
-        self.phase = 1 if cfg.freeze_backbone_epochs > 0 else 2
+        # ── Phase management (3-phase progressive fine-tuning) ──────────
+        if cfg.freeze_backbone_epochs > 0:
+            self.phase = 1
+        elif cfg.partial_unfreeze_epochs > 0:
+            self.phase = 2
+        else:
+            self.phase = 3
+
         if self.phase == 1:
-            self._set_backbone_frozen(True)
+            self._set_backbone_frozen("frozen")
             logger.info("Phase 1: backbone frozen, training heads for %d epochs",
                         cfg.freeze_backbone_epochs)
+        elif self.phase == 2:
+            self._set_backbone_frozen("partial")
+            logger.info("Phase 2: last backbone stage unfrozen for %d epochs",
+                        cfg.partial_unfreeze_epochs)
 
         # ── Optimizer + Scheduler (depends on phase) ────────────────────
         self._setup_optimizer_and_scheduler()
@@ -53,9 +67,9 @@ class Trainer:
         # ── Mixed precision ─────────────────────────────────────────────
         self.scaler = torch.amp.GradScaler("cuda", enabled=cfg.mixed_precision)
 
-        # ── EMA (created at phase 2 transition for meaningful averages) ─
+        # ── EMA (created at phase 2+ for meaningful averages) ───────────
         self.ema: EMAModel | None = None
-        if cfg.use_ema and self.phase == 2:
+        if cfg.use_ema and self.phase >= 2:
             self.ema = EMAModel(self.model, decay=cfg.ema_decay)
 
         # ── Data ────────────────────────────────────────────────────────
@@ -70,42 +84,77 @@ class Trainer:
         self.global_step = 0
         self.best_auc = 0.0
         self.epochs_no_improve = 0
-        self._phase2_start_epoch = cfg.freeze_backbone_epochs
-        self._phase2_base_lrs: list[float] = []
+        self._current_phase_start_epoch = 0
+        self._current_phase_base_lrs: list[float] = []
 
     # ── Backbone freeze / unfreeze ──────────────────────────────────────
 
-    def _set_backbone_frozen(self, frozen: bool) -> None:
+    def _set_backbone_frozen(self, mode: str) -> None:
+        """Set backbone freeze mode: 'frozen', 'partial', or 'unfrozen'.
+
+        'partial' unfreezes only the last backbone stage (stage 3) for
+        Phase 2 progressive fine-tuning.
+        """
         for name, p in self.model.named_parameters():
-            if "backbone" in name:
-                p.requires_grad = not frozen
+            if "backbone" not in name:
+                continue
+            if mode == "frozen":
+                p.requires_grad = False
+            elif mode == "partial":
+                is_last_stage = ("stages.3" in name or "stages_3" in name
+                                 or "norm3" in name)
+                p.requires_grad = is_last_stage
+            else:  # unfrozen
+                p.requires_grad = True
         n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.model.parameters())
         logger.info("Backbone %s: %.1fM / %.1fM params trainable",
-                     "FROZEN" if frozen else "UNFROZEN",
-                     n_train / 1e6, n_total / 1e6)
+                     mode.upper(), n_train / 1e6, n_total / 1e6)
 
     # ── Optimizer + Scheduler creation ──────────────────────────────────
 
     def _setup_optimizer_and_scheduler(self) -> None:
         cfg = self.cfg
         if self.phase == 1:
-            # Phase 1: only head parameters
+            # Phase 1: only head parameters (backbone frozen)
             params = [p for p in self.model.parameters() if p.requires_grad]
             self.optimizer = torch.optim.AdamW(
                 params,
                 lr=cfg.learning_rate * cfg.head_lr_multiplier,
                 weight_decay=cfg.weight_decay,
             )
-        else:
-            # Phase 2: differential LR (backbone at low LR, heads at higher LR)
-            backbone_params = [p for n, p in self.model.named_parameters()
-                               if "backbone" in n]
-            head_params = [p for n, p in self.model.named_parameters()
-                           if "backbone" not in n]
+        elif self.phase == 2:
+            # Phase 2: last backbone stage + heads (differential LR)
+            last_stage_params = []
+            head_params = []
+            for n, p in self.model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if "backbone" in n:
+                    last_stage_params.append(p)
+                else:
+                    head_params.append(p)
             self.optimizer = torch.optim.AdamW([
-                {"params": backbone_params, "lr": cfg.learning_rate},
-                {"params": head_params,     "lr": cfg.learning_rate * cfg.head_lr_multiplier},
+                {"params": last_stage_params, "lr": cfg.learning_rate},
+                {"params": head_params,       "lr": cfg.learning_rate * cfg.head_lr_multiplier},
+            ], weight_decay=cfg.weight_decay)
+        else:
+            # Phase 3: full backbone (3 groups: early stages, last stage, heads)
+            early_backbone = []
+            late_backbone = []
+            head_params = []
+            for n, p in self.model.named_parameters():
+                if "backbone" in n:
+                    if "stages.3" in n or "stages_3" in n or "norm3" in n:
+                        late_backbone.append(p)
+                    else:
+                        early_backbone.append(p)
+                else:
+                    head_params.append(p)
+            self.optimizer = torch.optim.AdamW([
+                {"params": early_backbone, "lr": cfg.learning_rate * 0.1},
+                {"params": late_backbone,  "lr": cfg.learning_rate},
+                {"params": head_params,    "lr": cfg.learning_rate * cfg.head_lr_multiplier},
             ], weight_decay=cfg.weight_decay)
 
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -113,34 +162,50 @@ class Trainer:
             patience=cfg.lr_reduce_patience, min_lr=cfg.min_lr,
         )
 
-    # ── Phase transition ────────────────────────────────────────────────
+    # ── Phase transitions ─────────────────────────────────────────────────
 
     def _transition_to_phase2(self, epoch: int) -> None:
         logger.info("=" * 70)
-        logger.info("PHASE 2: Unfreezing backbone at epoch %d", epoch)
+        logger.info("PHASE 2: Partially unfreezing backbone (last stage) at epoch %d", epoch)
         self.phase = 2
-        self._set_backbone_frozen(False)
+        self._set_backbone_frozen("partial")
         self._setup_optimizer_and_scheduler()
-        self._phase2_start_epoch = epoch
-        self._phase2_base_lrs = [pg["lr"] for pg in self.optimizer.param_groups]
+        self._current_phase_start_epoch = epoch
+        self._current_phase_base_lrs = [pg["lr"] for pg in self.optimizer.param_groups]
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.cfg.mixed_precision)
         if self.cfg.use_ema:
             self.ema = EMAModel(self.model, decay=self.cfg.ema_decay)
-        logger.info("  Backbone LR=%.2e  Head LR=%.2e  Warmup=%d epochs",
-                     self._phase2_base_lrs[0], self._phase2_base_lrs[-1],
+        logger.info("  Last-stage LR=%.2e  Head LR=%.2e  Warmup=%d epochs",
+                     self._current_phase_base_lrs[0], self._current_phase_base_lrs[-1],
                      self.cfg.warmup_epochs)
+        logger.info("=" * 70)
+
+    def _transition_to_phase3(self, epoch: int) -> None:
+        logger.info("=" * 70)
+        logger.info("PHASE 3: Full backbone unfreeze (low LR) at epoch %d", epoch)
+        self.phase = 3
+        self._set_backbone_frozen("unfrozen")
+        self._setup_optimizer_and_scheduler()
+        self._current_phase_start_epoch = epoch
+        self._current_phase_base_lrs = [pg["lr"] for pg in self.optimizer.param_groups]
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.cfg.mixed_precision)
+        if self.ema is not None:
+            self.ema = EMAModel(self.model, decay=self.cfg.ema_decay)
+        logger.info("  Early-bb LR=%.2e  Late-bb LR=%.2e  Head LR=%.2e  Warmup=%d ep",
+                     self._current_phase_base_lrs[0], self._current_phase_base_lrs[1],
+                     self._current_phase_base_lrs[-1], self.cfg.warmup_epochs)
         logger.info("=" * 70)
 
     # ── Warmup LR adjustment ───────────────────────────────────────────
 
     def _apply_warmup_lr(self, epoch: int) -> None:
-        """Linear warmup for the first few epochs after backbone unfreeze."""
-        if self.phase != 2 or not self._phase2_base_lrs:
+        """Linear warmup for the first few epochs after each phase transition."""
+        if self.phase == 1 or not self._current_phase_base_lrs:
             return
-        phase2_epoch = epoch - self._phase2_start_epoch
-        if 0 <= phase2_epoch < self.cfg.warmup_epochs:
-            factor = (phase2_epoch + 1) / self.cfg.warmup_epochs
-            for pg, base_lr in zip(self.optimizer.param_groups, self._phase2_base_lrs):
+        phase_epoch = epoch - self._current_phase_start_epoch
+        if 0 <= phase_epoch < self.cfg.warmup_epochs:
+            factor = (phase_epoch + 1) / self.cfg.warmup_epochs
+            for pg, base_lr in zip(self.optimizer.param_groups, self._current_phase_base_lrs):
                 pg["lr"] = base_lr * factor
             logger.info("  Warmup: factor=%.3f  backbone_lr=%.2e  head_lr=%.2e",
                         factor, self.optimizer.param_groups[0]["lr"],
@@ -169,11 +234,16 @@ class Trainer:
         logger.info("Resuming from checkpoint: %s", latest)
         ckpt = load_checkpoint(latest, device=str(self.device))
 
-        # Restore phase state (transition to phase 2 if needed before loading optimizer)
-        saved_phase = ckpt.get("phase", 2)
-        if saved_phase == 2 and self.phase == 1:
+        # Restore phase state (transition phases as needed before loading optimizer)
+        saved_phase = ckpt.get("phase", 3)
+        if saved_phase >= 2 and self.phase == 1:
             self._transition_to_phase2(
-                ckpt.get("phase2_start_epoch", self.cfg.freeze_backbone_epochs))
+                ckpt.get("current_phase_start_epoch",
+                         ckpt.get("phase2_start_epoch", self.cfg.freeze_backbone_epochs)))
+        if saved_phase >= 3 and self.phase == 2:
+            phase3_start = self.cfg.freeze_backbone_epochs + self.cfg.partial_unfreeze_epochs
+            self._transition_to_phase3(
+                ckpt.get("current_phase_start_epoch", phase3_start))
 
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -183,9 +253,12 @@ class Trainer:
         self.global_step = ckpt.get("global_step", 0)
         self.best_auc = ckpt.get("best_auc", 0.0)
         self.epochs_no_improve = ckpt.get("epochs_no_improve", 0)
-        self._phase2_start_epoch = ckpt.get("phase2_start_epoch",
-                                             self.cfg.freeze_backbone_epochs)
-        self._phase2_base_lrs = ckpt.get("phase2_base_lrs", [])
+        self._current_phase_start_epoch = ckpt.get(
+            "current_phase_start_epoch",
+            ckpt.get("phase2_start_epoch", self.cfg.freeze_backbone_epochs))
+        self._current_phase_base_lrs = ckpt.get(
+            "current_phase_base_lrs",
+            ckpt.get("phase2_base_lrs", []))
 
         # Restore EMA
         if self.ema is not None and "ema_state" in ckpt:
@@ -207,8 +280,8 @@ class Trainer:
             "best_auc": self.best_auc,
             "epochs_no_improve": self.epochs_no_improve,
             "phase": self.phase,
-            "phase2_start_epoch": self._phase2_start_epoch,
-            "phase2_base_lrs": self._phase2_base_lrs,
+            "current_phase_start_epoch": self._current_phase_start_epoch,
+            "current_phase_base_lrs": self._current_phase_base_lrs,
             "config": vars(self.cfg),
         }
         if self.ema is not None:
@@ -334,6 +407,31 @@ class Trainer:
 
         return avg
 
+    # ── TTA (Test Time Augmentation) ───────────────────────────────────────
+
+    def _tta_augmentations(self, images: torch.Tensor) -> list:
+        """Generate TTA augmented image batches (excluding original).
+
+        Returns up to (tta_augmentations - 1) augmented versions.
+        """
+        augmented = []
+        n = self.cfg.tta_augmentations
+
+        # 1. Horizontal flip
+        if n >= 2:
+            augmented.append(torch.flip(images, dims=[-1]))
+        # 2. Slight rotation (+5 degrees)
+        if n >= 3:
+            augmented.append(TF.rotate(images, 5))
+        # 3. Slight rotation (-5 degrees)
+        if n >= 4:
+            augmented.append(TF.rotate(images, -5))
+        # 4. Horizontal flip + slight rotation
+        if n >= 5:
+            augmented.append(TF.rotate(torch.flip(images, dims=[-1]), 5))
+
+        return augmented
+
     # ── Validate ────────────────────────────────────────────────────────
 
     @torch.no_grad()
@@ -344,8 +442,11 @@ class Trainer:
         n_batches = 0
         total_val_batches = len(self.val_loader)
         total_bbox_samples = 0
+        use_tta = self.cfg.use_tta
 
-        logger.debug("-- Val   epoch %02d  |  %d batches --", epoch, total_val_batches)
+        logger.debug("-- Val   epoch %02d  |  %d batches  |  TTA=%s --",
+                     epoch, total_val_batches,
+                     f"{self.cfg.tta_augmentations} views" if use_tta else "off")
 
         pbar = tqdm(self.val_loader, desc=f"Val   E{epoch:02d}",
                     leave=False, dynamic_ncols=True)
@@ -367,7 +468,18 @@ class Trainer:
             n_batches += 1
             total_bbox_samples += int(bbox_mask.sum().item())
 
-            all_logits.append(logits.cpu().numpy())
+            # TTA: average logits across augmented views for AUC
+            if use_tta:
+                tta_logits = [logits]
+                for aug_images in self._tta_augmentations(images):
+                    with torch.amp.autocast("cuda", enabled=self.cfg.mixed_precision):
+                        aug_logits, _ = self.model(aug_images, metadata)
+                    tta_logits.append(aug_logits)
+                avg_logits = torch.stack(tta_logits).mean(dim=0)
+                all_logits.append(avg_logits.cpu().numpy())
+            else:
+                all_logits.append(logits.cpu().numpy())
+
             all_labels.append(labels.cpu().numpy())
 
         avg = {k: v / max(n_batches, 1) for k, v in running.items()}
@@ -415,22 +527,29 @@ class Trainer:
         logger.info("Effective batch size: %d  (batch %d x accum %d)",
                      self.cfg.batch_size * self.cfg.grad_accum_steps,
                      self.cfg.batch_size, self.cfg.grad_accum_steps)
-        logger.info("Phase %d  |  freeze_backbone_epochs=%d  |  warmup_epochs=%d",
+        logger.info("Phase %d  |  phase1=%d  phase2=%d  phase3=%d+  |  warmup=%d",
                      self.phase, self.cfg.freeze_backbone_epochs,
+                     self.cfg.partial_unfreeze_epochs,
+                     max(0, self.cfg.epochs - self.cfg.freeze_backbone_epochs - self.cfg.partial_unfreeze_epochs),
                      self.cfg.warmup_epochs)
         if self.cfg.use_ema:
             logger.info("EMA enabled  (decay=%.4f)", self.cfg.ema_decay)
+        if self.cfg.use_tta:
+            logger.info("TTA enabled  (%d augmentation views)", self.cfg.tta_augmentations)
         logger.info("=" * 70)
 
         for epoch in range(self.start_epoch, self.cfg.epochs):
             t0 = time.time()
 
-            # ── Phase transition ────────────────────────────────────────
+            # ── Phase transitions (3-phase progressive fine-tuning) ───
             if (self.phase == 1
                     and epoch >= self.cfg.freeze_backbone_epochs):
                 self._transition_to_phase2(epoch)
+            elif (self.phase == 2
+                    and epoch >= self.cfg.freeze_backbone_epochs + self.cfg.partial_unfreeze_epochs):
+                self._transition_to_phase3(epoch)
 
-            # ── Warmup LR for early phase-2 epochs ─────────────────────
+            # ── Warmup LR for early phase-2/3 epochs ───────────────────
             self._apply_warmup_lr(epoch)
 
             # Train
@@ -447,8 +566,8 @@ class Trainer:
             mean_auc = val_metrics.get("mean_AUC", 0.0)
 
             # ── Step ReduceLROnPlateau (after warmup) ───────────────────
-            phase2_epoch = epoch - self._phase2_start_epoch if self.phase == 2 else -1
-            if phase2_epoch >= self.cfg.warmup_epochs:
+            phase_epoch = epoch - self._current_phase_start_epoch if self.phase >= 2 else -1
+            if phase_epoch >= self.cfg.warmup_epochs:
                 old_lr = self.optimizer.param_groups[0]["lr"]
                 self.scheduler.step(mean_auc)
                 new_lr = self.optimizer.param_groups[0]["lr"]

@@ -117,19 +117,26 @@ def setup_logging(cfg: Config) -> logging.Logger:
 
 
 class FocalLoss(nn.Module):
-    """Sigmoid-based focal loss for multi-label classification."""
+    """Sigmoid-based focal loss for multi-label classification.
+
+    Supports per-class alpha for class imbalance reweighting.
+    """
 
     def __init__(self, alpha: float = 0.25, gamma: float = 2.0,
                  label_smoothing: float = 0.0,
-                 pos_weight: Optional[torch.Tensor] = None) -> None:
+                 pos_weight: Optional[torch.Tensor] = None,
+                 class_alpha: Optional[torch.Tensor] = None) -> None:
         super().__init__()
-        self.alpha = alpha
         self.gamma = gamma
         self.label_smoothing = label_smoothing
         self.register_buffer("pos_weight", pos_weight)
+        # Per-class alpha overrides scalar alpha when provided
+        if class_alpha is not None:
+            self.register_buffer("alpha", class_alpha)
+        else:
+            self.register_buffer("alpha", torch.tensor(float(alpha)))
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Optional label smoothing
         if self.label_smoothing > 0:
             targets = targets * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
 
@@ -139,7 +146,13 @@ class FocalLoss(nn.Module):
         )
         p = torch.sigmoid(logits)
         pt = torch.where(targets >= 0.5, p, 1.0 - p)
-        alpha_t = torch.where(targets >= 0.5, self.alpha, 1.0 - self.alpha)
+        # Per-class alpha [C] broadcasts to [B, C], or scalar alpha
+        if self.alpha.dim() == 0:
+            alpha_t = torch.where(targets >= 0.5, self.alpha, 1.0 - self.alpha)
+        else:
+            alpha_pos = self.alpha.unsqueeze(0)
+            alpha_neg = 1.0 - alpha_pos
+            alpha_t = torch.where(targets >= 0.5, alpha_pos, alpha_neg)
         focal_weight = alpha_t * (1.0 - pt).pow(self.gamma)
         return (focal_weight * bce).mean()
 
@@ -148,7 +161,8 @@ class CombinedLoss(nn.Module):
     """Combined classification (focal) + detection (smooth-L1) loss."""
 
     def __init__(self, cfg: Config,
-                 pos_weight: Optional[torch.Tensor] = None) -> None:
+                 pos_weight: Optional[torch.Tensor] = None,
+                 class_alpha: Optional[torch.Tensor] = None) -> None:
         super().__init__()
         self.cls_weight = cfg.cls_loss_weight
         self.bbox_weight = cfg.bbox_loss_weight
@@ -158,6 +172,7 @@ class CombinedLoss(nn.Module):
             gamma=cfg.focal_gamma,
             label_smoothing=cfg.label_smoothing,
             pos_weight=pos_weight,
+            class_alpha=class_alpha,
         )
         self.smooth_l1 = nn.SmoothL1Loss(reduction="none", beta=0.1)
 

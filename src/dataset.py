@@ -179,6 +179,30 @@ def compute_class_weights(train_df: pd.DataFrame, cfg: Config) -> torch.Tensor:
     return torch.tensor(weights, dtype=torch.float32)
 
 
+def compute_class_alpha(train_df: pd.DataFrame, cfg: Config) -> torch.Tensor:
+    """Compute per-class focal alpha from disease frequency.
+
+    Rare diseases get higher alpha -> more weight on positive predictions.
+    This is critical for NIH ChestX-ray14 where class prevalence ranges
+    from ~1% (Hernia) to ~18% (Infiltration).
+    """
+    counts = np.zeros(cfg.num_classes, dtype=np.float64)
+    for labels_str in train_df["Finding Labels"]:
+        for lbl in labels_str.split("|"):
+            lbl = lbl.strip()
+            if lbl in cfg.disease_classes:
+                counts[cfg.disease_classes.index(lbl)] += 1
+    total = len(train_df)
+    freq = counts / total
+    alpha = 1.0 - freq
+    alpha = np.clip(alpha, 0.05, 0.95)
+    logger.info("Per-class focal alpha (rare diseases -> high alpha):")
+    for name, a, c in zip(cfg.disease_classes, alpha, counts):
+        logger.info("  %-25s alpha=%.3f  (n=%d, freq=%.2f%%)",
+                     name, a, int(c), 100.0 * c / total)
+    return torch.tensor(alpha, dtype=torch.float32)
+
+
 # ── Grayscale standardization ───────────────────────────────────────────────
 
 
