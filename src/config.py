@@ -51,8 +51,8 @@ class Config:
 
     # ── Training ────────────────────────────────────────────────────────
     epochs: int = 50
-    batch_size: int = 4
-    grad_accum_steps: int = 8              # effective batch = 32
+    batch_size: int = 8
+    grad_accum_steps: int = 4              # effective batch = 32
     learning_rate: float = 3e-5            # backbone LR (low to preserve pretrained features)
     head_lr_multiplier: float = 10.0       # head gets 3e-4
     weight_decay: float = 2e-4
@@ -80,8 +80,11 @@ class Config:
     drop_path_rate: float = 0.3            # stochastic depth in backbone
     label_smoothing: float = 0.1
     gradient_clip: float = 1.0
-    focal_alpha: float = 0.25
-    focal_gamma: float = 2.0
+
+    # ── ASL (Asymmetric Loss) – arxiv 2009.14119 ────────────────────────
+    asl_gamma_neg: float = 3.0             # down-weight easy negatives
+    asl_gamma_pos: float = 0.0             # no focusing on positives (standard BCE behavior)
+    asl_clip: float = 0.05                 # probability margin shift for negatives
 
     # ── Loss weights ────────────────────────────────────────────────────
     cls_loss_weight: float = 1.0

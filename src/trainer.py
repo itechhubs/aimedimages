@@ -1,5 +1,5 @@
 """Training pipeline with phased training (freeze/unfreeze backbone),
-ReduceLROnPlateau, EMA, mixed-precision, gradient accumulation,
+CosineAnnealingLR, EMA, Mixup, mixed-precision, gradient accumulation,
 checkpoint resume, early stopping, and TensorBoard logging."""
 
 import logging
@@ -42,6 +42,8 @@ class Trainer:
 
         # ── Phase management ────────────────────────────────────────────
         self.phase = 1 if cfg.freeze_backbone_epochs > 0 else 2
+        self._phase2_start_epoch = cfg.freeze_backbone_epochs
+        self._phase2_base_lrs: list[float] = []
         if self.phase == 1:
             self._set_backbone_frozen(True)
             logger.info("Phase 1: backbone frozen, training heads for %d epochs",
@@ -70,8 +72,6 @@ class Trainer:
         self.global_step = 0
         self.best_auc = 0.0
         self.epochs_no_improve = 0
-        self._phase2_start_epoch = cfg.freeze_backbone_epochs
-        self._phase2_base_lrs: list[float] = []
 
     # ── Backbone freeze / unfreeze ──────────────────────────────────────
 
@@ -108,9 +108,11 @@ class Trainer:
                 {"params": head_params,     "lr": cfg.learning_rate * cfg.head_lr_multiplier},
             ], weight_decay=cfg.weight_decay)
 
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode="max", factor=cfg.lr_reduce_factor,
-            patience=cfg.lr_reduce_patience, min_lr=cfg.min_lr,
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=max(self.cfg.epochs - self._phase2_start_epoch
+                      - self.cfg.warmup_epochs, 1),
+            eta_min=self.cfg.min_lr,
         )
 
     # ── Phase transition ────────────────────────────────────────────────
@@ -177,7 +179,11 @@ class Trainer:
 
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        try:
+            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        except Exception:
+            logger.warning("Could not restore scheduler state "
+                           "(scheduler type may have changed) - using fresh scheduler")
         self.scaler.load_state_dict(ckpt["scaler_state_dict"])
         self.start_epoch = ckpt["epoch"] + 1
         self.global_step = ckpt.get("global_step", 0)
@@ -246,6 +252,13 @@ class Trainer:
             metadata = batch["metadata"].to(self.device, non_blocking=True)
             bbox_targets = batch["bbox_targets"].to(self.device, non_blocking=True)
             bbox_mask = batch["bbox_mask"].to(self.device, non_blocking=True)
+
+            # Mixup augmentation (images + classification labels only)
+            if self.cfg.mixup_alpha > 0:
+                lam = np.random.beta(self.cfg.mixup_alpha, self.cfg.mixup_alpha)
+                perm = torch.randperm(images.size(0), device=self.device)
+                images = lam * images + (1.0 - lam) * images[perm]
+                labels = lam * labels + (1.0 - lam) * labels[perm]
 
             with torch.amp.autocast("cuda", enabled=self.cfg.mixed_precision):
                 logits, bbox_pred = self.model(images, metadata)
@@ -389,17 +402,17 @@ class Trainer:
                     total_bbox_samples)
 
         # Per-class AUC table
-        logger.debug("  [Epoch %02d] Per-class AUC-ROC:", epoch)
-        logger.debug("  %-25s  %8s  %8s  %8s", "Disease", "AUC", "#Pos", "#Neg")
-        logger.debug("  %s", "-" * 55)
+        logger.info("  [Epoch %02d] Per-class AUC-ROC:", epoch)
+        logger.info("  %-25s  %8s  %8s  %8s", "Disease", "AUC", "#Pos", "#Neg")
+        logger.info("  %s", "-" * 55)
         for i, name in enumerate(self.cfg.disease_classes):
             auc_val = auc_dict.get(name, float("nan"))
             n_pos = int(all_labels_np[:, i].sum())
             n_neg = n_val_images - n_pos
             auc_str = f"{auc_val:.4f}" if auc_val == auc_val else "  N/A"
-            logger.debug("  %-25s  %8s  %8d  %8d", name, auc_str, n_pos, n_neg)
-        logger.debug("  %s", "-" * 55)
-        logger.debug("  %-25s  %8.4f", "MEAN AUC", auc_dict.get("mean_AUC", 0.0))
+            logger.info("  %-25s  %8s  %8d  %8d", name, auc_str, n_pos, n_neg)
+        logger.info("  %s", "-" * 55)
+        logger.info("  %-25s  %8.4f", "MEAN AUC", auc_dict.get("mean_AUC", 0.0))
 
         return avg
 
@@ -446,15 +459,10 @@ class Trainer:
             elapsed = time.time() - t0
             mean_auc = val_metrics.get("mean_AUC", 0.0)
 
-            # ── Step ReduceLROnPlateau (after warmup) ───────────────────
+            # ── Step cosine annealing scheduler (after warmup) ──────────
             phase2_epoch = epoch - self._phase2_start_epoch if self.phase == 2 else -1
             if phase2_epoch >= self.cfg.warmup_epochs:
-                old_lr = self.optimizer.param_groups[0]["lr"]
-                self.scheduler.step(mean_auc)
-                new_lr = self.optimizer.param_groups[0]["lr"]
-                if new_lr < old_lr:
-                    logger.info("  ReduceLROnPlateau: LR reduced %.2e -> %.2e",
-                                old_lr, new_lr)
+                self.scheduler.step()
 
             # ── Epoch summary log ───────────────────────────────────────
             logger.info("=" * 70)

@@ -116,32 +116,57 @@ def setup_logging(cfg: Config) -> logging.Logger:
 # ── Loss functions ──────────────────────────────────────────────────────────
 
 
-class FocalLoss(nn.Module):
-    """Sigmoid-based focal loss for multi-label classification."""
+class AsymmetricLoss(nn.Module):
+    """Asymmetric Loss for multi-label classification.
 
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0,
-                 label_smoothing: float = 0.0,
+    Uses different focusing strengths for positive vs negative examples,
+    which is more effective than symmetric Focal Loss for imbalanced
+    multi-label tasks like chest X-ray diagnosis.
+
+    Reference: Ben-Baruch et al., "Asymmetric Loss For Multi-Label
+    Classification" (https://arxiv.org/abs/2009.14119)
+    """
+
+    def __init__(self, gamma_neg: float = 4.0, gamma_pos: float = 1.0,
+                 clip: float = 0.05, label_smoothing: float = 0.0,
                  pos_weight: Optional[torch.Tensor] = None) -> None:
         super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
         self.label_smoothing = label_smoothing
         self.register_buffer("pos_weight", pos_weight)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Optional label smoothing
         if self.label_smoothing > 0:
             targets = targets * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
 
-        bce = F.binary_cross_entropy_with_logits(
-            logits, targets, reduction="none",
-            pos_weight=self.pos_weight,
-        )
-        p = torch.sigmoid(logits)
-        pt = torch.where(targets >= 0.5, p, 1.0 - p)
-        alpha_t = torch.where(targets >= 0.5, self.alpha, 1.0 - self.alpha)
-        focal_weight = alpha_t * (1.0 - pt).pow(self.gamma)
-        return (focal_weight * bce).mean()
+        xs_pos = torch.sigmoid(logits)
+        xs_neg = 1.0 - xs_pos
+
+        # Asymmetric probability clipping (shift negatives toward 0)
+        if self.clip > 0:
+            xs_neg = (xs_neg + self.clip).clamp(max=1.0)
+
+        # Per-sample BCE components
+        loss_pos = targets * torch.log(xs_pos.clamp(min=1e-8))
+        loss_neg = (1.0 - targets) * torch.log(xs_neg.clamp(min=1e-8))
+
+        # Apply pos_weight to positive term if provided
+        if self.pos_weight is not None:
+            loss = loss_pos * self.pos_weight.unsqueeze(0) + loss_neg
+        else:
+            loss = loss_pos + loss_neg
+
+        # Asymmetric focal weighting (detached for stable gradients)
+        pt_pos = xs_pos * targets
+        pt_neg = xs_neg * (1.0 - targets)
+        pt = pt_pos + pt_neg
+        gamma = self.gamma_pos * targets + self.gamma_neg * (1.0 - targets)
+        focal_weight = torch.pow(1.0 - pt, gamma).detach()
+        loss = loss * focal_weight
+
+        return -loss.mean()
 
 
 class CombinedLoss(nn.Module):
@@ -153,9 +178,10 @@ class CombinedLoss(nn.Module):
         self.cls_weight = cfg.cls_loss_weight
         self.bbox_weight = cfg.bbox_loss_weight
 
-        self.focal = FocalLoss(
-            alpha=cfg.focal_alpha,
-            gamma=cfg.focal_gamma,
+        self.cls_loss_fn = AsymmetricLoss(
+            gamma_neg=cfg.asl_gamma_neg,
+            gamma_pos=cfg.asl_gamma_pos,
+            clip=cfg.asl_clip,
             label_smoothing=cfg.label_smoothing,
             pos_weight=pos_weight,
         )
@@ -169,7 +195,7 @@ class CombinedLoss(nn.Module):
         bbox_targets: torch.Tensor,
         bbox_mask: torch.Tensor,
     ) -> dict:
-        cls_loss = self.focal(logits, labels)
+        cls_loss = self.cls_loss_fn(logits, labels)
 
         # BBox loss only where annotations exist
         if bbox_mask.sum() > 0:

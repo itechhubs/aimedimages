@@ -17,6 +17,7 @@ import random
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import pandas as pd
 import torch
@@ -183,28 +184,26 @@ def compute_class_weights(train_df: pd.DataFrame, cfg: Config) -> torch.Tensor:
 
 
 def standardize_grayscale(image: Image.Image) -> Image.Image:
-    """Standardize a grayscale X-ray image to consistent 8-bit range.
+    """Standardize a grayscale X-ray image using CLAHE.
 
     Steps:
         1. Convert to mode ``"L"`` (8-bit grayscale) if not already.
-        2. Apply histogram equalization to normalize contrast across
-           different scanners, exposure settings, and imaging protocols.
+        2. Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+           to normalize contrast while preserving local detail.
         3. Result is a clean 8-bit [0, 255] grayscale image.
 
-    This ensures that all X-ray images—regardless of source scanner,
-    window/level settings, or bit depth—are mapped to a standardized
-    grayscale range before any further augmentation or normalization.
+    CLAHE is preferred over global histogram equalization for medical
+    imaging because it preserves local contrast variations that carry
+    diagnostic information (e.g., subtle opacities, nodule edges).
     """
-    # Ensure 8-bit grayscale
     if image.mode != "L":
         image = image.convert("L")
 
-    # Histogram equalization: spreads the intensity distribution evenly
-    # across the full 0-255 range.  This compensates for different
-    # scanners, exposure times, and post-processing pipelines.
-    image = ImageOps.equalize(image)
+    img_array = np.array(image)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    img_array = clahe.apply(img_array)
 
-    return image
+    return Image.fromarray(img_array, mode="L")
 
 
 def grayscale_to_3ch(image: Image.Image) -> Image.Image:
